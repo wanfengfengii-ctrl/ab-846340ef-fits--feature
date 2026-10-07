@@ -65,6 +65,8 @@ class Reason:
     TOO_MANY_HDUS = "TOO_MANY_HDUS"
     TRAILING_BYTES = "TRAILING_BYTES"
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    # Materialization-only reason (never produced by audit_bytes).
+    INSUFFICIENT_HEADER_SPACE = "INSUFFICIENT_HEADER_SPACE"
 
 
 class AuditFailure(Exception):
@@ -226,7 +228,11 @@ def _read_header(data, start, hdu):
     """Read one header; returns (cards, end_card_offset, content_end).
 
     ``content_end`` is the offset just past the END card; the padded
-    header end is derived from it by the caller.
+    header end is derived from it by the caller.  Blank card slots
+    following the END card may additionally hold ``DATASUM`` /
+    ``CHECKSUM`` cards materialized in place of header padding; such
+    cards are returned like ordinary cards and validated as part of the
+    HDU.
     """
     cards = []
     pos = start
@@ -261,9 +267,40 @@ def _read_header(data, start, hdu):
                     "END card at offset %d must be blank after the keyword"
                     % pos,
                 )
-            return cards, pos, pos + CARD_SIZE
+            end_offset = pos
+            content_end = pos + CARD_SIZE
+            break
         cards.append(Card(pos, keyword, has_value, image))
         pos += CARD_SIZE
+
+    # The FITS standard ends header content at the END card; the rest of
+    # the last 2880-byte block is space padding.  A checksum materialized
+    # by this service is allowed to occupy what would otherwise be a
+    # blank card slot there (it never shifts the END card or any HDU
+    # boundary).  Recognize those slots here so they are verified like
+    # any other DATASUM/CHECKSUM card; any other non-space content is
+    # left untouched here and reported as bad padding by the caller,
+    # exactly as before.
+    for slot in range(content_end,
+                      start + _round_up(content_end - start, BLOCK_SIZE),
+                      CARD_SIZE):
+        if slot + CARD_SIZE > len(data):
+            break
+        image = data[slot : slot + CARD_SIZE]
+        if image == b" " * CARD_SIZE:
+            continue
+        if image[:8] not in (b"DATASUM ", b"CHECKSUM"):
+            continue
+        # Only a well-formed printable-ASCII value card ('= ' in
+        # columns 9-10) is recognized as a materialized checksum card;
+        # anything else that merely starts with these letters stays
+        # padding and is reported as such by the caller, preserving the
+        # historic audit verdict byte for byte.
+        if image[8:10] != b"= " or min(image) < 0x20 or max(image) > 0x7E:
+            continue
+        keyword = image[:8].rstrip(b" ").decode("ascii")
+        cards.append(Card(slot, keyword, True, image))
+    return cards, end_offset, content_end
 
 
 def _parse_integer(card, hdu, keyword):
@@ -611,14 +648,22 @@ def _audit_hdu(data, start, hdu):
             {"headerOffset": start, "fileSize": len(data)},
         )
     padding = data[content_end:header_end]
-    if padding.strip(b" "):
-        bad = next(i for i, b in enumerate(padding) if b != 0x20)
+    # Card slots after END that carry materialized DATASUM/CHECKSUM
+    # cards are legitimate occupants of the header padding; every other
+    # non-space byte still rejects the HDU.
+    occupied = [
+        (c.offset - content_end, CARD_SIZE)
+        for c in cards if c.offset >= content_end
+    ]
+    for i, b in enumerate(padding):
+        if b == 0x20 or any(lo <= i < lo + length for lo, length in occupied):
+            continue
         raise AuditFailure(
-            hdu, Reason.NONSPACE_HEADER_PADDING, content_end + bad,
+            hdu, Reason.NONSPACE_HEADER_PADDING, content_end + i,
             "non-space byte 0x%02X in header padding at offset %d "
             "(header padding must be ASCII spaces)"
-            % (padding[bad], content_end + bad),
-            {"byte": "0x%02X" % padding[bad]},
+            % (b, content_end + i),
+            {"byte": "0x%02X" % b},
         )
 
     structure = _validate_structure(cards, hdu, end_offset)
@@ -747,3 +792,182 @@ def audit_bytes(data):
         "hdus": hdus,
         "failure": failure,
     }
+
+
+# ---------------------------------------------------------------------------
+# Checksum materialization.
+# ---------------------------------------------------------------------------
+
+
+class MaterializationFailure(Exception):
+    """Raised when no materialized file can be produced.
+
+    ``report`` is an audit-shaped report dict (``conclusion`` /
+    ``failure`` / ``hdus`` ...): either the unchanged rejection report of
+    the mandatory full audit that ran first, or a synthesized report
+    carrying the ``INSUFFICIENT_HEADER_SPACE`` failure.
+    """
+
+    __slots__ = ("report",)
+
+    def __init__(self, report):
+        super().__init__(report.get("failure", {}).get("message", ""))
+        self.report = report
+
+
+def _hdu_layout(data, start, hdu):
+    """Re-derive the audited layout of one HDU for materialization.
+
+    The full audit has already passed, so none of the parsing calls
+    below can fail.  Returns the structure dict together with every
+    offset needed to place checksum cards.
+    """
+    cards, end_offset, content_end = _read_header(data, start, hdu)
+    header_end = start + _round_up(content_end - start, BLOCK_SIZE)
+    structure = _validate_structure(cards, hdu, end_offset)
+    elements = 1
+    for length in structure["axes"]:
+        elements *= length
+    if structure["naxis"] == 0:
+        elements = 0
+    data_bytes = (
+        (abs(structure["bitpix"]) // 8)
+        * structure["gcount"]
+        * (structure["pcount"] + elements)
+    )
+    data_start = header_end
+    data_end = data_start + data_bytes
+    return {
+        "start": start,
+        "cards": cards,
+        "end_offset": end_offset,
+        "content_end": content_end,
+        "header_end": header_end,
+        "data_start": data_start,
+        "data_end": data_end,
+        "structure": structure,
+    }
+
+
+def _datasum_card_image(value):
+    """80-byte integer DATASUM card (standard integer-value form)."""
+    return (b"DATASUM = %20d" % value).ljust(CARD_SIZE, b" ")
+
+
+def _checksum_card_image(value):
+    """80-byte CHECKSUM card carrying the 16-character encoded value."""
+    return (b"CHECKSUM= '" + value.encode("ascii") + b"'").ljust(
+        CARD_SIZE, b" ")
+
+
+def materialize_checksums(data):
+    """Return *data* with missing DATASUM/CHECKSUM cards filled in.
+
+    A full audit runs first; any structural, boundary or existing
+    checksum rejection aborts materialization (no output file).  For
+    every accepted HDU the missing cards are placed into blank card
+    slots *after* the END card within the existing header padding, so
+    the scientific payload, the END card and every HDU boundary stay
+    byte-for-byte in place; the affected checksums are recomputed per
+    the FITS convention.  If any HDU lacks enough blank slots the whole
+    request fails with ``INSUFFICIENT_HEADER_SPACE`` (no partial
+    result).  An input whose HDUs already carry two valid checksum
+    cards is returned unchanged, byte for byte.
+    """
+    report = audit_bytes(data)
+    if report["conclusion"] != ACCEPTED:
+        raise MaterializationFailure(report)
+
+    layouts = []
+    pos = 0
+    index = 0
+    while pos < len(data):
+        layout = _hdu_layout(data, pos, index)
+        layouts.append(layout)
+        pos = layout["data_start"] + _round_up(
+            layout["data_end"] - layout["data_start"], BLOCK_SIZE)
+        index += 1
+
+    # Determine the needs of every HDU before touching a single byte:
+    # insufficient space anywhere rejects the complete request.  Slots
+    # after END already occupied by materialized DATASUM/CHECKSUM cards
+    # are not available.
+    needs = []
+    for index, layout in enumerate(layouts):
+        structure = layout["structure"]
+        blank_slots = [
+            off for off in range(layout["content_end"], layout["header_end"],
+                                 CARD_SIZE)
+            if data[off : off + CARD_SIZE] == b" " * CARD_SIZE
+        ]
+        required = (0 if structure["datasum_card"] is not None else 1) \
+            + (0 if structure["checksum_card"] is not None else 1)
+        if required > len(blank_slots):
+            failure = {
+                "hdu": index,
+                "reason": Reason.INSUFFICIENT_HEADER_SPACE,
+                "offset": layout["end_offset"],
+                "message": (
+                    "HDU %d has %d blank card slot(s) after the END card at "
+                    "offset %d but needs %d slot(s) for the missing "
+                    "DATASUM/CHECKSUM cards"
+                    % (index, len(blank_slots), layout["end_offset"],
+                       required)),
+                "details": {
+                    "endOffset": layout["end_offset"],
+                    "availableSlots": len(blank_slots),
+                    "requiredSlots": required,
+                },
+            }
+            blocked = dict(report)
+            blocked["conclusion"] = REJECTED
+            blocked["failure"] = failure
+            raise MaterializationFailure(blocked)
+        needs.append(required)
+
+    if not any(needs):
+        # Every HDU already carries two valid checksum cards: the
+        # accepted input must come back byte-for-byte unchanged.
+        return data
+
+    out = bytearray(data)
+    for index, layout in enumerate(layouts):
+        structure = layout["structure"]
+        data_section = bytes(out[layout["data_start"]:layout["data_end"]])
+        datasum = sum32_be(data_section)
+
+        def first_blank_slot():
+            for off in range(layout["content_end"], layout["header_end"],
+                             CARD_SIZE):
+                if out[off : off + CARD_SIZE] == b" " * CARD_SIZE:
+                    return off
+            raise AssertionError("blank slot counted during planning "
+                                 "vanished")  # pragma: no cover
+
+        # Add the missing DATASUM card (if any) into the first blank slot
+        # after END.  Adding cards to the header can invalidate a
+        # pre-existing CHECKSUM, which is recomputed below.
+        if structure["datasum_card"] is None:
+            slot = first_blank_slot()
+            out[slot : slot + CARD_SIZE] = _datasum_card_image(datasum)
+
+        checksum_card = structure["checksum_card"]
+        if checksum_card is None:
+            # Occupy the next blank slot: a zero placeholder while the
+            # header sum is taken, then the encoded final value.
+            target = first_blank_slot() + 11  # after "CHECKSUM= '"
+            out[target - 11 : target - 11 + CARD_SIZE] = \
+                _checksum_card_image("0" * 16)
+        else:
+            # Recomputing an affected value never moves the card: only
+            # its 16-character value field is rewritten in place.
+            _, q0, _ = _parse_string(checksum_card, index, "CHECKSUM")
+            target = checksum_card.offset + q0 + 1
+
+        header = bytearray(out[layout["start"]:layout["header_end"]])
+        header[target - layout["start"]
+               : target - layout["start"] + 16] = b"0" * 16
+        total = sum32_be(bytes(header), datasum)
+        encoded = char_encode(~total & UINT32_MAX).encode("ascii")
+        out[target : target + 16] = encoded
+    return bytes(out)

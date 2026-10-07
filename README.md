@@ -24,7 +24,7 @@ echo "verify exit code: $?"
 |----|----|------|
 | 0 | 1 | 代码测试（`python -m unittest` 全量单元测试） |
 | 1 | 2 | 应用构建（`compileall` 字节编译 + 应用模块导入） |
-| 2 | 4 | HTTP 冒烟（合法文件、DATASUM/CHECKSUM 摘要损坏、截断文件、尾随字节、错误媒体类型） |
+| 2 | 4 | HTTP 冒烟（合法文件、DATASUM/CHECKSUM 摘要损坏、截断文件、尾随字节、错误媒体类型、缺卡补齐、幂等重试、空间不足、补齐后复审） |
 
 全部通过时退出码为 0。
 
@@ -95,6 +95,47 @@ echo "verify exit code: $?"
 审计按 HDU 顺序进行，在**最早失败**处停止：`failure` 稳定给出失败 HDU 的零基编号、
 原因码 `reason` 与可定位的字节偏移 `offset`（同一输入字节串永远产生同一报告）。
 
+### `POST /api/fits/checksums/materialize`
+
+* 请求体：原始 FITS 文件，`Content-Type: application/fits`，限制与审计端点完全相同
+  （不超过 16 MiB、需要 `Content-Length`，同样的 411/413/415 等请求级错误）。
+* 服务先对文件执行**完整审计**；结构、数据边界或已有校验值不合格（审计裁决
+  `REJECTED`）时不生成任何文件，返回 **HTTP 422** 与和审计端点逐字段一致的 JSON
+  报告（`conclusion` / `failure` / `hdus` …）。
+* 审计通过后，为每个缺少校验卡的 HDU 在**头块 END 卡之后的空白卡位**补入缺失的
+  `DATASUM` 与 `CHECKSUM`，并按 FITS checksum 约定重算受影响的校验值。科学载荷、
+  `END` 卡位置与全部 HDU 边界逐字节不变，文件总长度不变（不新增头块）。
+* 成功返回 **HTTP 200**，`Content-Type: application/fits`，体为补齐后的文件。
+* 任一 HDU 的空白卡位不足以容纳需补入的卡片时，**整份请求失败**：返回 **HTTP 422**
+  JSON（不会返回部分结果），`failure` 稳定给出 HDU 编号、原因码
+  `INSUFFICIENT_HEADER_SPACE`、END 卡偏移以及卡位统计：
+
+```json
+{
+  "conclusion": "REJECTED",
+  "fileSize": 2880,
+  "hduCount": 1,
+  "hdus": [ /* 已通过审计的 HDU 0 */ ],
+  "failure": {
+    "hdu": 0,
+    "reason": "INSUFFICIENT_HEADER_SPACE",
+    "offset": 2720,
+    "message": "HDU 0 has 1 blank card slot(s) after the END card at offset 2720 but needs 2 slot(s) for the missing DATASUM/CHECKSUM cards",
+    "details": {"endOffset": 2720, "availableSlots": 1, "requiredSlots": 2}
+  }
+}
+```
+
+补齐规则与幂等性：
+
+* 每个 HDU 独立处理；已含两张有效校验卡的 HDU（乃至整份输入）**逐字节原样返回**。
+* 新卡按顺序放入 END 之后的空白卡位：先 `DATASUM`（标准整数卡），后 `CHECKSUM`。
+* 若某 HDU 已有 `DATASUM` 而缺 `CHECKSUM`（或反之），只补缺失的卡；新增 `DATASUM`
+  改变头部时，既有 `CHECKSUM` 在原卡位内被重算，绝不移动卡片。
+* 该操作是幂等的：对补齐结果再次调用，返回完全相同的字节（客户端可安全重试）。
+* 补入的卡片位于头块补齐区，重新审计时按有效校验卡验证；补齐后的文件必须在
+  `/api/fits/audit` 上得到全部 HDU `VALID`/`VALID` 的裁决。
+
 ### 其他端点
 
 * `GET /health` — 健康检查（Docker healthcheck 使用），返回 `{"status": "ok"}`。
@@ -145,6 +186,7 @@ dataBytes = |BITPIX|/8 × GCOUNT × (PCOUNT + NAXIS1 × NAXIS2 × … × NAXISn)
 | `CHECKSUM_MISMATCH` | CHECKSUM 与计算值不符 | CHECKSUM 卡 |
 | `TOO_MANY_HDUS` | 超过 1 主 + 15 扩展 | 第 17 个 HDU 起点 |
 | `TRAILING_BYTES` | 末尾不足一个 2880 字节块的残余字节 | 残余起点 |
+| `INSUFFICIENT_HEADER_SPACE` | 仅补齐接口：END 后空白卡位不足以补入缺失校验卡（审计接口不产生此码） | END 卡 |
 
 ## 本地开发（无 Docker）
 
@@ -158,7 +200,7 @@ API_URL=http://127.0.0.1:8000 python3 -m verify   # 运行 verify 三阶段
 
 ```
 fitsaudit/
-  core.py       解析、结构校验、DATASUM/CHECKSUM 验证（纯标准库）
+  core.py       解析、结构校验、DATASUM/CHECKSUM 验证与缺卡补齐（纯标准库）
   server.py     HTTP API（http.server，线程模式）
   fixtures.py   测试/冒烟用 FITS 构造器（复用核心校验和函数）
 tests/

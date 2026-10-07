@@ -5,8 +5,10 @@ from .core import (  # noqa: F401
     REJECTED,
     MAX_FILE_BYTES,
     MAX_HDUS,
+    MaterializationFailure,
     Reason,
     audit_bytes,
+    materialize_checksums,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

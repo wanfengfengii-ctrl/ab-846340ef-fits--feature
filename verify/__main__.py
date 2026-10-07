@@ -69,19 +69,30 @@ def run_build():
     return ok
 
 
-def _post(path, blob, content_type="application/fits"):
+def _post(path, blob, content_type="application/fits", raw=False):
     req = urllib.request.Request(
         API_URL + path, data=blob, method="POST",
         headers={"Content-Type": content_type})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
+            body = resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+            if raw:
+                return resp.status, ctype, body
+            return resp.status, _decode_json(body)
     except urllib.error.HTTPError as exc:
         body = exc.read()
-        try:
-            return exc.code, json.loads(body.decode("utf-8"))
-        except ValueError:
-            return exc.code, {}
+        ctype = exc.headers.get("Content-Type", "") if exc.headers else ""
+        if raw:
+            return exc.code, ctype, body
+        return exc.code, _decode_json(body)
+
+
+def _decode_json(body):
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {}
 
 
 def _get(path):
@@ -112,6 +123,7 @@ def run_smoke():
 
     sys.path.insert(0, ROOT)
     from fitsaudit import fixtures  # noqa: PLC0415
+    from fitsaudit.core import audit_bytes  # noqa: PLC0415
 
     valid = open(os.path.join(ROOT, "tests", "data",
                               "valid_astropy.fits"), "rb").read()
@@ -190,6 +202,127 @@ def run_smoke():
     ok = status == 415
     checks.append(ok)
     print("%-28s %s" % ("wrong media type -> 415",
+                        "PASS" if ok else "FAIL (status %d)" % status),
+          flush=True)
+
+    # -- checksum materialization smoke ---------------------------------
+
+    materialize_path = "/api/fits/checksums/materialize"
+
+    # Early FITS without any checksum cards: the endpoint fills the
+    # missing DATASUM/CHECKSUM cards and returns a FITS body of the same
+    # length (the science payload and HDU boundaries are untouched).
+    early = fixtures.build_valid_file(2, checksums=False)
+    status, ctype, completed = _post(materialize_path, early, raw=True)
+    problems = []
+    if status != 200:
+        problems.append("status %d != 200" % status)
+    if ctype != "application/fits":
+        problems.append("content-type %r != application/fits" % ctype)
+    if len(completed) != len(early):
+        problems.append("length %d != %d" % (len(completed), len(early)))
+    if completed == early:
+        problems.append("returned bytes were not materialized")
+    if problems:
+        checks.append(False)
+        print("%-28s FAIL (%s)" % ("missing cards materialized",
+                                   "; ".join(problems)), flush=True)
+    else:
+        # Science sections must be byte-identical; only header padding
+        # (spaces in the input) may have changed.
+        early_report = audit_bytes(early)
+        same_payload = all(
+            completed[h["data"]["offset"]
+                      :h["data"]["offset"] + h["data"]["paddedBytes"]]
+            == early[h["data"]["offset"]
+                     :h["data"]["offset"] + h["data"]["paddedBytes"]]
+            for h in early_report["hdus"])
+        only_spaces = all(a == 0x20 for a, b in zip(early, completed)
+                          if a != b)
+        ok = same_payload and only_spaces
+        checks.append(ok)
+        print("%-28s %s" % (
+            "missing cards materialized",
+            "PASS" if ok
+            else "FAIL (payload changed: %s, non-space touched: %s)"
+                 % (same_payload, only_spaces)), flush=True)
+
+    # Post-completion re-audit: the completed file must earn a full
+    # VALID/VALID verdict for every HDU through the audit endpoint.
+    status, re_report = _post("/api/fits/audit", completed)
+    ok = (status == 200
+          and re_report.get("conclusion") == "ACCEPTED"
+          and re_report.get("hduCount") == 3
+          and all(h["datasum"].get("verdict") == "VALID"
+                  and h["checksum"].get("verdict") == "VALID"
+                  for h in re_report.get("hdus", [])))
+    checks.append(ok)
+    print("%-28s %s" % (
+        "completed file re-audits VALID",
+        "PASS" if ok else "FAIL (%r)" % re_report), flush=True)
+
+    # Idempotent retry: materializing the result again must return the
+    # exact same bytes (a fully checksummed file passes through).
+    status, ctype, retried = _post(materialize_path, completed, raw=True)
+    ok = status == 200 and ctype == "application/fits" \
+        and retried == completed
+    checks.append(ok)
+    print("%-28s %s" % (
+        "idempotent retry byte-identical",
+        "PASS" if ok else "FAIL (status %d)" % status), flush=True)
+
+    # An already complete input is returned byte-for-byte unchanged.
+    status, _, passthrough = _post(materialize_path, valid, raw=True)
+    ok = status == 200 and passthrough == valid
+    checks.append(ok)
+    print("%-28s %s" % ("complete input passes through",
+                        "PASS" if ok else "FAIL (status %d)" % status),
+          flush=True)
+
+    # Insufficient header space: 34 content cards + END leave a single
+    # blank slot while two cards are required.  The whole request fails
+    # with 422 JSON naming the HDU, the reason, the END offset and the
+    # slot counts -- never a (partial) FITS file.
+    tight_cards = [fixtures.card("SIMPLE", True), fixtures.card("BITPIX", 8),
+                   fixtures.card("NAXIS", 0)]
+    tight_cards += [fixtures.card("COMMENT", None) for _ in range(31)]
+    tight = fixtures.header_block(tight_cards)
+    status, ctype, raw_body = _post(materialize_path, tight, raw=True)
+    space_report = _decode_json(raw_body)
+    failure = space_report.get("failure") or {}
+    details = failure.get("details") or {}
+    ok = (status == 422 and ctype == "application/json"
+          and space_report.get("conclusion") == "REJECTED"
+          and failure.get("hdu") == 0
+          and failure.get("reason") == "INSUFFICIENT_HEADER_SPACE"
+          and failure.get("offset") == 34 * 80
+          and details.get("endOffset") == 34 * 80
+          and details.get("availableSlots") == 1
+          and details.get("requiredSlots") == 2)
+    checks.append(ok)
+    print("%-28s %s" % (
+        "insufficient header space -> 422",
+        "PASS" if ok else "FAIL (status %d, %r)" % (status, failure)),
+        flush=True)
+
+    # A structurally rejected input must not produce a file either.
+    status, ctype, raw_body = _post(
+        materialize_path, valid[:6000], raw=True)
+    blocked = _decode_json(raw_body)
+    ok = (status == 422 and ctype == "application/json"
+          and (blocked.get("failure") or {}).get("reason")
+          == "TRUNCATED_DATA")
+    checks.append(ok)
+    print("%-28s %s" % (
+        "truncated input blocked -> 422",
+        "PASS" if ok else "FAIL (status %d)" % status), flush=True)
+
+    # Wrong media type is a request-level error on this endpoint too.
+    status, _, _ = _post(materialize_path, early,
+                         content_type="application/octet-stream", raw=True)
+    ok = status == 415
+    checks.append(ok)
+    print("%-28s %s" % ("materialize wrong media type -> 415",
                         "PASS" if ok else "FAIL (status %d)" % status),
           flush=True)
 
