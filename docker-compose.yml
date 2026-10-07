@@ -1,0 +1,36 @@
+name: fits-audit
+
+services:
+  api:
+    build: .
+    image: fits-audit:latest
+    environment:
+      PORT: 8000
+    ports:
+      # Host-side port is configurable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8080}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: fits-audit:latest
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_URL: http://api:8000
+    command: ["python", "-m", "verify"]
+    # One-shot service: runs tests + build + HTTP smoke, then exits with
+    # a summarized exit code (0 = all passed; bit 0 tests, bit 1 build,
+    # bit 2 smoke).
+    restart: "no"
