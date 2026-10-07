@@ -17,6 +17,12 @@ Any header-field conflict, out-of-bounds data, trailing bytes or
 checksum mismatch rejects the whole file.  The audit deterministically
 reports the earliest failing HDU, a stable reason code and a locatable
 byte offset.
+
+This module also implements checksum materialization for early FITS
+files that are structurally valid but lack DATASUM/CHECKSUM cards: the
+missing cards are inserted ahead of the END card, consuming blank card
+slots from the header padding that follows END, so neither the science
+payload nor any HDU boundary moves.
 """
 
 from __future__ import annotations
@@ -65,6 +71,9 @@ class Reason:
     TOO_MANY_HDUS = "TOO_MANY_HDUS"
     TRAILING_BYTES = "TRAILING_BYTES"
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    # Materialization-only: an HDU lacks the blank header card slots
+    # needed to hold the missing DATASUM/CHECKSUM cards.
+    INSUFFICIENT_HEADER_SPACE = "INSUFFICIENT_HEADER_SPACE"
 
 
 class AuditFailure(Exception):
@@ -597,6 +606,20 @@ def _round_up(n, multiple):
     return n if n % multiple == 0 else n + multiple - n % multiple
 
 
+def _declared_data_bytes(structure):
+    """Data-section length implied by BITPIX/NAXISn/PCOUNT/GCOUNT."""
+    elements = 1
+    for length in structure["axes"]:
+        elements *= length
+    if structure["naxis"] == 0:
+        elements = 0
+    return (
+        (abs(structure["bitpix"]) // 8)
+        * structure["gcount"]
+        * (structure["pcount"] + elements)
+    )
+
+
 def _audit_hdu(data, start, hdu):
     """Audit one HDU; returns (report_dict, offset_of_next_hdu)."""
     cards, end_offset, content_end = _read_header(data, start, hdu)
@@ -623,16 +646,7 @@ def _audit_hdu(data, start, hdu):
 
     structure = _validate_structure(cards, hdu, end_offset)
 
-    elements = 1
-    for length in structure["axes"]:
-        elements *= length
-    if structure["naxis"] == 0:
-        elements = 0
-    data_bytes = (
-        (abs(structure["bitpix"]) // 8)
-        * structure["gcount"]
-        * (structure["pcount"] + elements)
-    )
+    data_bytes = _declared_data_bytes(structure)
     data_start = header_end
     data_end = data_start + data_bytes
     padded_end = data_start + _round_up(data_bytes, BLOCK_SIZE)
@@ -747,3 +761,182 @@ def audit_bytes(data):
         "hdus": hdus,
         "failure": failure,
     }
+
+
+# ---------------------------------------------------------------------------
+# Checksum materialization: fill missing DATASUM/CHECKSUM cards into the
+# blank card slots of the header padding without moving any HDU boundary
+# or touching the science payload.
+# ---------------------------------------------------------------------------
+
+
+def _datasum_card_image(datasum):
+    """An 80-byte DATASUM card in the canonical integer form."""
+    raw = ("%-8s= %20d" % ("DATASUM", datasum)).encode("ascii")
+    return raw.ljust(CARD_SIZE, b" ")
+
+
+def _checksum_card_image(text="0" * 16):
+    """An 80-byte CHECKSUM card holding the 16-character *text*."""
+    raw = ("%-8s= '%s'" % ("CHECKSUM", text)).encode("ascii")
+    return raw.ljust(CARD_SIZE, b" ")
+
+
+def _plan_hdu_materialization(data, pos, index):
+    """Inspect one (already audited) HDU; returns (plan_or_None, next_pos).
+
+    The plan carries everything needed to splice the missing cards into
+    the header padding later.  Raises AuditFailure with
+    INSUFFICIENT_HEADER_SPACE when the header padding cannot hold the
+    missing cards.
+    """
+    cards, end_offset, content_end = _read_header(data, pos, index)
+    header_len = _round_up(content_end - pos, BLOCK_SIZE)
+    header_end = pos + header_len
+    structure = _validate_structure(cards, index, end_offset)
+    data_bytes = _declared_data_bytes(structure)
+    data_start = header_end
+    padded_end = data_start + _round_up(data_bytes, BLOCK_SIZE)
+
+    missing = []
+    if structure["datasum_card"] is None:
+        missing.append("DATASUM")
+    if structure["checksum_card"] is None:
+        missing.append("CHECKSUM")
+    if not missing:
+        return None, padded_end
+
+    # The only usable space: whole blank card slots of the header
+    # padding between the END card and the end of the padded header.
+    available = (header_end - content_end) // CARD_SIZE
+    if available < len(missing):
+        raise AuditFailure(
+            index, Reason.INSUFFICIENT_HEADER_SPACE, end_offset,
+            "HDU %d needs %d blank header card slot(s) after the END "
+            "card at offset %d to add %s, but only %d slot(s) remain"
+            % (index, len(missing), end_offset, ", ".join(missing),
+               available),
+            {
+                "endOffset": end_offset,
+                "requiredCards": len(missing),
+                "availableCards": available,
+                "missingKeywords": list(missing),
+            },
+        )
+
+    plan = {
+        "hdu": index,
+        "header_start": pos,
+        "header_end": header_end,
+        "end_offset": end_offset,
+        "missing": missing,
+        # A pre-existing CHECKSUM card must be re-encoded once the
+        # header gains a card; keep its position for the in-place fix.
+        "checksum_card_offset": (
+            None if structure["checksum_card"] is None
+            else structure["checksum_card"].offset),
+        "datasum": sum32_be(data[data_start:data_start + data_bytes]),
+    }
+    return plan, padded_end
+
+
+def _materialize_hdu(out, plan):
+    """Splice the planned cards into one HDU of the bytearray *out*.
+
+    The new cards go immediately ahead of the END card and the same
+    number of blank slots is dropped from the padding that follows END,
+    so the padded header length — and every later byte offset — is
+    unchanged.  The CHECKSUM covering the final header is (re)computed
+    and written into its card in place.
+    """
+    pos = plan["header_start"]
+    header_end = plan["header_end"]
+    end_offset = plan["end_offset"]
+    missing = plan["missing"]
+
+    new_cards = []
+    if "DATASUM" in missing:
+        new_cards.append(_datasum_card_image(plan["datasum"]))
+    if "CHECKSUM" in missing:
+        new_cards.append(_checksum_card_image())
+    inserted = b"".join(new_cards)
+    consumed = len(new_cards) * CARD_SIZE
+
+    header = (bytes(out[pos:end_offset]) + inserted
+              + bytes(out[end_offset:header_end - consumed]))
+
+    # Locate the CHECKSUM card inside the final header: the one just
+    # inserted, or the pre-existing card (its offset is unchanged
+    # because existing cards sit ahead of the insertion point).
+    if "CHECKSUM" in missing:
+        card_at = end_offset - pos + len(inserted) - CARD_SIZE
+    else:
+        card_at = plan["checksum_card_offset"] - pos
+    quote = header.index(b"'", card_at, card_at + CARD_SIZE)
+    value_at = quote + 1
+
+    blanked = bytearray(header)
+    blanked[value_at:value_at + 16] = b"0" * 16
+    total = sum32_be(bytes(blanked), plan["datasum"])
+    encoded = char_encode(~total & UINT32_MAX).encode("ascii")
+    header = header[:value_at] + encoded + header[value_at + 16:]
+
+    out[pos:header_end] = header
+
+
+def materialize_checksums(data):
+    """Add missing DATASUM/CHECKSUM cards to a valid FITS file.
+
+    The file is fully audited first.  Returns ``(output, report)``:
+
+    * audit rejected: ``(None, audit_report)`` — the same report
+      ``audit_bytes`` produces, no file is generated;
+    * an HDU lacks blank header card slots: ``(None, report)`` where
+      the report carries the audit envelope with a failure whose
+      reason is ``INSUFFICIENT_HEADER_SPACE`` (no partial output);
+    * success: ``(output_bytes, summary)`` where *output_bytes* is the
+      input with the missing cards spliced into header padding — an
+      input that already has both valid cards in every HDU is returned
+      byte for byte.
+    """
+    audit = audit_bytes(data)
+    if audit["failure"] is not None:
+        return None, audit
+
+    plans = []
+    pos = 0
+    index = 0
+    try:
+        while pos < len(data):
+            plan, pos = _plan_hdu_materialization(data, pos, index)
+            if plan is not None:
+                plans.append(plan)
+            index += 1
+    except AuditFailure as exc:
+        report = dict(audit)
+        report["conclusion"] = REJECTED
+        report["failure"] = exc.as_dict()
+        return None, report
+
+    if not plans:
+        summary = {
+            "changed": False,
+            "fileSize": len(data),
+            "hduCount": index,
+            "addedCards": [],
+        }
+        return data, summary
+
+    out = bytearray(data)
+    added = []
+    for plan in plans:
+        _materialize_hdu(out, plan)
+        added.append({"hdu": plan["hdu"], "keywords": plan["missing"]})
+    output = bytes(out)
+    summary = {
+        "changed": True,
+        "fileSize": len(output),
+        "hduCount": index,
+        "addedCards": added,
+    }
+    return output, summary

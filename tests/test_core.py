@@ -13,7 +13,9 @@ from fitsaudit.core import (
     audit_bytes,
     char_decode,
     char_encode,
+    materialize_checksums,
     sum32_be,
+    UINT32_MAX,
 )
 from fitsaudit.fixtures import END_CARD, card, data_block, header_block
 
@@ -382,6 +384,202 @@ class RejectionTests(unittest.TestCase):
         blob = fixtures.primary_hdu() + bytes(16 * 1024 * 1024)
         self.assert_rejected(blob, Reason.FILE_TOO_LARGE, hdu=0,
                              offset=16 * 1024 * 1024)
+
+
+class MaterializeTests(unittest.TestCase):
+    """Checksum materialization: fill missing DATASUM/CHECKSUM cards
+    into header padding without moving HDU boundaries or the payload."""
+
+    def assert_all_valid(self, blob):
+        report = audit_bytes(blob)
+        self.assertEqual(report["conclusion"], ACCEPTED, report)
+        self.assertTrue(report["hdus"])
+        for hdu in report["hdus"]:
+            self.assertEqual(hdu["datasum"]["verdict"], "VALID", hdu)
+            self.assertEqual(hdu["checksum"]["verdict"], "VALID", hdu)
+        return report
+
+    def test_fills_missing_cards_every_hdu(self):
+        blob = fixtures.build_valid_file(2, checksums=False)
+        out, summary = materialize_checksums(blob)
+        self.assertIsNotNone(out)
+        self.assertTrue(summary["changed"])
+        self.assertEqual(summary["hduCount"], 3)
+        self.assertEqual(summary["addedCards"], [
+            {"hdu": i, "keywords": ["DATASUM", "CHECKSUM"]}
+            for i in range(3)
+        ])
+        # the file neither grows nor shrinks
+        self.assertEqual(len(out), len(blob))
+        report = self.assert_all_valid(out)
+        # HDU boundaries are unchanged
+        before = audit_bytes(blob)
+        self.assertEqual([h["range"] for h in before["hdus"]],
+                         [h["range"] for h in report["hdus"]])
+        # the science payload is byte-identical
+        for h in report["hdus"]:
+            start = h["data"]["offset"]
+            end = start + h["data"]["bytes"]
+            self.assertEqual(out[start:end], blob[start:end])
+
+    def test_complete_file_returned_byte_identical(self):
+        blob = fixtures.build_valid_file(2)
+        out, summary = materialize_checksums(blob)
+        self.assertIs(out, blob)
+        self.assertFalse(summary["changed"])
+        self.assertEqual(summary["addedCards"], [])
+
+    def test_astropy_reference_file_byte_identical(self):
+        blob = load_fixture("valid_astropy.fits")
+        out, summary = materialize_checksums(blob)
+        self.assertEqual(out, blob)
+        self.assertFalse(summary["changed"])
+
+    def test_idempotent_retry(self):
+        blob = fixtures.build_valid_file(2, checksums=False)
+        once, _ = materialize_checksums(blob)
+        twice, summary = materialize_checksums(once)
+        self.assertEqual(twice, once)
+        self.assertFalse(summary["changed"])
+
+    def test_only_checksum_missing(self):
+        data = b"\x01\x02\x03\x04"
+        cards = [card("SIMPLE", True), card("BITPIX", 8),
+                 card("NAXIS", 1), card("NAXIS1", 4),
+                 card("DATASUM", sum32_be(data))]
+        blob = header_block(cards) + data_block(data)
+        out, summary = materialize_checksums(blob)
+        self.assertEqual(summary["addedCards"],
+                         [{"hdu": 0, "keywords": ["CHECKSUM"]}])
+        self.assert_all_valid(out)
+        # the pre-existing DATASUM card is untouched
+        self.assertEqual(out[4 * 80:5 * 80], blob[4 * 80:5 * 80])
+
+    def test_datasum_string_form_preserved(self):
+        # astropy writes DATASUM as a quoted string; the card must be
+        # kept as-is when only CHECKSUM is added.
+        data = struct.pack(">4h", 1, -2, 3, -4)
+        cards = [card("SIMPLE", True), card("BITPIX", 16),
+                 card("NAXIS", 1), card("NAXIS1", 4),
+                 card("DATASUM", str(sum32_be(data)))]
+        blob = header_block(cards) + data_block(data)
+        out, summary = materialize_checksums(blob)
+        self.assertEqual(summary["addedCards"],
+                         [{"hdu": 0, "keywords": ["CHECKSUM"]}])
+        self.assertEqual(out[4 * 80:5 * 80], blob[4 * 80:5 * 80])
+        report = self.assert_all_valid(out)
+        self.assertEqual(report["hdus"][0]["datasum"]["stored"],
+                         sum32_be(data))
+
+    def test_only_datasum_missing_recomputes_existing_checksum(self):
+        # A valid CHECKSUM without a DATASUM card: adding DATASUM
+        # changes the header, so the existing CHECKSUM card must be
+        # re-encoded in place.
+        cards = [card("SIMPLE", True), card("BITPIX", 8),
+                 card("NAXIS", 0), card("CHECKSUM", "0" * 16)]
+        total = sum32_be(header_block(cards), 0)
+        cards[-1] = card("CHECKSUM", char_encode(~total & UINT32_MAX))
+        blob = header_block(cards)
+        self.assertEqual(audit_bytes(blob)["conclusion"], ACCEPTED)
+        out, summary = materialize_checksums(blob)
+        self.assertEqual(summary["addedCards"],
+                         [{"hdu": 0, "keywords": ["DATASUM"]}])
+        self.assert_all_valid(out)
+        # the CHECKSUM card stays at its offset; its value changed
+        self.assertEqual(out[3 * 80:3 * 80 + 11], blob[3 * 80:3 * 80 + 11])
+        self.assertNotEqual(out[3 * 80:4 * 80], blob[3 * 80:4 * 80])
+
+    def test_new_cards_sit_before_end_card(self):
+        blob = fixtures.primary_hdu()
+        out, _ = materialize_checksums(blob)
+        end_in = fixtures.find_card(blob, "END")
+        end_out = fixtures.find_card(out, "END")
+        # the END card shifts by exactly the two inserted cards
+        self.assertEqual(end_out, end_in + 2 * 80)
+        self.assertEqual(out[end_out - 2 * 80:end_out - 2 * 80 + 8],
+                         b"DATASUM ")
+        self.assertEqual(out[end_out - 80:end_out - 80 + 8], b"CHECKSUM")
+        # padding after END is the original padding minus the two
+        # consumed blank slots
+        self.assertEqual(out[end_out + 80:], blob[end_in + 80 + 2 * 80:])
+
+    def test_no_space_but_nothing_to_add(self):
+        # Header exactly fills one block and already carries both cards.
+        blob = fixtures.primary_hdu(
+            checksums=True,
+            extra_cards=[card("COMMENT", None) for _ in range(30)])
+        self.assertEqual(len(blob), 2880)
+        out, summary = materialize_checksums(blob)
+        self.assertEqual(out, blob)
+        self.assertFalse(summary["changed"])
+
+    def test_insufficient_space_zero_slots(self):
+        blob = fixtures.primary_hdu_free_slots(0)
+        out, report = materialize_checksums(blob)
+        self.assertIsNone(out)
+        self.assertEqual(report["conclusion"], REJECTED)
+        failure = report["failure"]
+        self.assertEqual(failure["reason"], "INSUFFICIENT_HEADER_SPACE")
+        self.assertEqual(failure["hdu"], 0)
+        self.assertEqual(failure["offset"], 35 * 80)  # the END card
+        self.assertEqual(failure["details"]["endOffset"], 35 * 80)
+        self.assertEqual(failure["details"]["requiredCards"], 2)
+        self.assertEqual(failure["details"]["availableCards"], 0)
+        self.assertEqual(failure["details"]["missingKeywords"],
+                         ["DATASUM", "CHECKSUM"])
+
+    def test_insufficient_space_one_slot(self):
+        blob = fixtures.primary_hdu_free_slots(1)
+        out, report = materialize_checksums(blob)
+        self.assertIsNone(out)
+        failure = report["failure"]
+        self.assertEqual(failure["reason"], "INSUFFICIENT_HEADER_SPACE")
+        self.assertEqual(failure["offset"], 34 * 80)
+        self.assertEqual(failure["details"]["requiredCards"], 2)
+        self.assertEqual(failure["details"]["availableCards"], 1)
+
+    def test_one_slot_suffices_for_checksum_only(self):
+        data = b"\x01\x02\x03\x04"
+        cards = [card("SIMPLE", True), card("BITPIX", 8),
+                 card("NAXIS", 1), card("NAXIS1", 4),
+                 card("DATASUM", sum32_be(data))]
+        cards += [card("COMMENT", None) for _ in range(29)]
+        blob = header_block(cards) + data_block(data)  # one free slot
+        out, summary = materialize_checksums(blob)
+        self.assertIsNotNone(out)
+        self.assertEqual(summary["addedCards"],
+                         [{"hdu": 0, "keywords": ["CHECKSUM"]}])
+        self.assert_all_valid(out)
+
+    def test_insufficient_space_in_later_hdu_fails_whole_request(self):
+        # HDU 0 has room and would be patched, HDU 1 does not: the
+        # request fails as a whole and no partial output is produced.
+        blob = fixtures.primary_hdu() + fixtures.image_hdu_free_slots(0)
+        out, report = materialize_checksums(blob)
+        self.assertIsNone(out)
+        failure = report["failure"]
+        self.assertEqual(failure["reason"], "INSUFFICIENT_HEADER_SPACE")
+        self.assertEqual(failure["hdu"], 1)
+        self.assertEqual(failure["offset"], 2880 + 35 * 80)
+
+    def test_audit_rejection_returns_audit_report(self):
+        blob = fixtures.corrupt_datasum(fixtures.build_valid_file(1),
+                                        occurrence=1)
+        out, report = materialize_checksums(blob)
+        self.assertIsNone(out)
+        self.assertEqual(report, audit_bytes(blob))
+        self.assertEqual(report["failure"]["reason"], "DATASUM_MISMATCH")
+
+    def test_truncated_input_not_materialized(self):
+        blob = fixtures.build_valid_file(1)[:6000]
+        out, report = materialize_checksums(blob)
+        self.assertIsNone(out)
+        self.assertEqual(report["failure"]["reason"], "TRUNCATED_DATA")
+
+    def test_empty_input_not_materialized(self):
+        out, report = materialize_checksums(b"")
+        self.assertIsNone(out)
+        self.assertEqual(report["failure"]["reason"], "EMPTY_FILE")
 
 
 if __name__ == "__main__":

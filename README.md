@@ -24,7 +24,7 @@ echo "verify exit code: $?"
 |----|----|------|
 | 0 | 1 | 代码测试（`python -m unittest` 全量单元测试） |
 | 1 | 2 | 应用构建（`compileall` 字节编译 + 应用模块导入） |
-| 2 | 4 | HTTP 冒烟（合法文件、DATASUM/CHECKSUM 摘要损坏、截断文件、尾随字节、错误媒体类型） |
+| 2 | 4 | HTTP 冒烟（合法文件、DATASUM/CHECKSUM 摘要损坏、截断文件、尾随字节、错误媒体类型；缺卡补齐、幂等重试、空间不足、补齐后复审） |
 
 全部通过时退出码为 0。
 
@@ -95,6 +95,42 @@ echo "verify exit code: $?"
 审计按 HDU 顺序进行，在**最早失败**处停止：`failure` 稳定给出失败 HDU 的零基编号、
 原因码 `reason` 与可定位的字节偏移 `offset`（同一输入字节串永远产生同一报告）。
 
+### `POST /api/fits/checksums/materialize`
+
+早期 FITS 文件可能结构合法但缺少 DATASUM/CHECKSUM 校验卡。本端点在**不改动科学载荷与
+HDU 边界**的前提下补齐缺失的校验卡，使文件获得全部有效校验裁决。
+
+* 请求体：原始 FITS 文件，`Content-Type: application/fits`，限制与审计端点相同
+  （16 MiB 上限、必需 Content-Length；`415`/`411`/`413`/`404`/`405` 行为一致）。
+* 先对输入执行完整审计；结构、边界或已有校验值不合格时**不生成文件**，返回
+  **HTTP 422** 与和审计端点完全相同的 JSON 报告（`conclusion: "REJECTED"`）。
+* 成功时返回 **HTTP 200**，`Content-Type: application/fits`，响应体为补齐后的文件：
+  * 每个 HDU 仅利用头块 END 卡之后的空白卡位插入缺失的 DATASUM / CHECKSUM 卡
+    （新卡紧随 END 之前，占用等量的头部补齐空间），文件长度、各 HDU 区间与数据段
+    逐字节不变；
+  * 受影响头部内已有的 CHECKSUM 按 FITS 标准重算并就地改写；
+  * 每个 HDU 都已含两张有效校验卡的输入**逐字节原样返回**（幂等：对返回值再次
+    请求得到完全相同的字节串）。
+* 任一 HDU 的空白卡位不足时整份请求失败（**HTTP 422**），不返回部分结果。JSON 稳定
+  给出失败 HDU、原因码 `INSUFFICIENT_HEADER_SPACE`、END 卡偏移与所需卡位：
+
+```json
+{
+  "conclusion": "REJECTED",
+  "fileSize": 2880,
+  "hduCount": 1,
+  "hdus": [ /* 完整审计结果 */ ],
+  "failure": {
+    "hdu": 0,
+    "reason": "INSUFFICIENT_HEADER_SPACE",
+    "offset": 2800,
+    "message": "HDU 0 needs 2 blank header card slot(s) after the END card at offset 2800 to add DATASUM, CHECKSUM, but only 0 slot(s) remain",
+    "details": {"endOffset": 2800, "requiredCards": 2, "availableCards": 0,
+                "missingKeywords": ["DATASUM", "CHECKSUM"]}
+  }
+}
+```
+
 ### 其他端点
 
 * `GET /health` — 健康检查（Docker healthcheck 使用），返回 `{"status": "ok"}`。
@@ -146,6 +182,12 @@ dataBytes = |BITPIX|/8 × GCOUNT × (PCOUNT + NAXIS1 × NAXIS2 × … × NAXISn)
 | `TOO_MANY_HDUS` | 超过 1 主 + 15 扩展 | 第 17 个 HDU 起点 |
 | `TRAILING_BYTES` | 末尾不足一个 2880 字节块的残余字节 | 残余起点 |
 
+以下原因码仅出现在 `POST /api/fits/checksums/materialize` 的失败响应中（HTTP 422）：
+
+| 原因码 | 含义 | offset 指向 |
+|--------|------|--------------|
+| `INSUFFICIENT_HEADER_SPACE` | HDU 头部 END 后的空白卡位不足以补入缺失的校验卡 | 该 HDU 的 END 卡 |
+
 ## 本地开发（无 Docker）
 
 ```bash
@@ -158,7 +200,7 @@ API_URL=http://127.0.0.1:8000 python3 -m verify   # 运行 verify 三阶段
 
 ```
 fitsaudit/
-  core.py       解析、结构校验、DATASUM/CHECKSUM 验证（纯标准库）
+  core.py       解析、结构校验、DATASUM/CHECKSUM 验证与缺卡补齐（纯标准库）
   server.py     HTTP API（http.server，线程模式）
   fixtures.py   测试/冒烟用 FITS 构造器（复用核心校验和函数）
 tests/

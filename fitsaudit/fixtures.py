@@ -123,6 +123,29 @@ def build_max_hdus_file():
     return b"".join(parts)
 
 
+def primary_hdu_free_slots(slots):
+    """A primary HDU (no data, no checksum cards) whose header padding
+    after the END card holds exactly ``slots`` blank 80-byte card slots
+    (0..32, as the header stays within one 2880-byte block)."""
+    if not 0 <= slots <= 32:  # pragma: no cover - defensive
+        raise ValueError("slots must be in 0..32")
+    cards = [card("SIMPLE", True), card("BITPIX", 8), card("NAXIS", 0)]
+    cards += [card("COMMENT", None) for _ in range(32 - slots)]
+    return header_block(cards)
+
+
+def image_hdu_free_slots(slots):
+    """An IMAGE extension HDU (no data, no checksum cards) whose header
+    padding after the END card holds exactly ``slots`` blank card slots
+    (0..30, as the header stays within one 2880-byte block)."""
+    if not 0 <= slots <= 30:  # pragma: no cover - defensive
+        raise ValueError("slots must be in 0..30")
+    cards = [card("XTENSION", "IMAGE"), card("BITPIX", 8),
+             card("NAXIS", 0), card("PCOUNT", 0), card("GCOUNT", 1)]
+    cards += [card("COMMENT", None) for _ in range(30 - slots)]
+    return header_block(cards)
+
+
 def find_card(blob, keyword, occurrence=0):
     """Return the absolute offset of the ``occurrence``-th card named
     ``keyword`` in *blob* (scanning 80-byte card boundaries)."""

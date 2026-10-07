@@ -6,7 +6,9 @@ code (bit flags, so failures compose):
 * bit 0 (1): code tests      -- the unit test suite (unittest discover)
 * bit 1 (2): application build -- byte-compilation and import of the app
 * bit 2 (4): HTTP smoke      -- audit verdicts over the live API for a
-  valid file, digest-corrupted files and a truncated file
+  valid file, digest-corrupted files and a truncated file, plus
+  checksum materialization (fill-in, idempotent retry, insufficient
+  header space and re-audit of the patched file)
 
 Exit code 0 means every stage passed.  The service is meant to be run
 once (``docker compose up --exit-code-from verify verify``) and then
@@ -82,6 +84,19 @@ def _post(path, blob, content_type="application/fits"):
             return exc.code, json.loads(body.decode("utf-8"))
         except ValueError:
             return exc.code, {}
+
+
+def _post_raw(path, blob, content_type="application/fits"):
+    """POST and return (status, headers, raw body) — for FITS replies."""
+    req = urllib.request.Request(
+        API_URL + path, data=blob, method="POST",
+        headers={"Content-Type": content_type})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, dict(resp.getheaders()), resp.read()
+    except urllib.error.HTTPError as exc:
+        headers = dict(exc.headers.items()) if exc.headers else {}
+        return exc.code, headers, exc.read()
 
 
 def _get(path):
@@ -192,6 +207,109 @@ def run_smoke():
     print("%-28s %s" % ("wrong media type -> 415",
                         "PASS" if ok else "FAIL (status %d)" % status),
           flush=True)
+
+    # -- POST /api/fits/checksums/materialize --------------------------
+    mat = "/api/fits/checksums/materialize"
+
+    def record(name, ok, detail=""):
+        checks.append(ok)
+        print("%-28s %s%s" % (name, "PASS" if ok else "FAIL",
+                              "" if ok else " (%s)" % detail),
+              flush=True)
+
+    # Missing DATASUM/CHECKSUM cards are filled in; the patched file is
+    # returned as application/fits and neither grows nor shrinks.
+    no_cards = fixtures.build_valid_file(2, checksums=False)
+    m_status, m_headers, materialized = _post_raw(mat, no_cards)
+    problems = []
+    if m_status != 200:
+        problems.append("status %d != 200" % m_status)
+    if m_headers.get("Content-Type") != "application/fits":
+        problems.append("Content-Type %r" % m_headers.get("Content-Type"))
+    if len(materialized) != len(no_cards):
+        problems.append("size %d != %d" % (len(materialized), len(no_cards)))
+    record("materialize fills missing cards", not problems,
+           "; ".join(problems))
+
+    # Re-audit of the patched file: ACCEPTED with all-VALID verdicts and
+    # unchanged HDU ranges.
+    _, before = _post("/api/fits/audit", no_cards)
+    _, after = _post("/api/fits/audit", materialized)
+
+    def hdu_ranges(rep):
+        return [(h["range"]["start"], h["range"]["end"])
+                for h in rep.get("hdus", [])]
+
+    problems = []
+    if after.get("conclusion") != "ACCEPTED":
+        problems.append("conclusion %r" % after.get("conclusion"))
+    verdicts = [(h["datasum"]["verdict"], h["checksum"]["verdict"])
+                for h in after.get("hdus", [])]
+    if not verdicts or any(v != ("VALID", "VALID") for v in verdicts):
+        problems.append("verdicts %r" % (verdicts,))
+    if hdu_ranges(before) != hdu_ranges(after):
+        problems.append("HDU ranges changed")
+    record("materialized file re-audits VALID", not problems,
+           "; ".join(problems))
+
+    # Idempotent retry: the patched file already carries both valid
+    # cards, so it comes back byte for byte.
+    r_status, _, again = _post_raw(mat, materialized)
+    record("materialize idempotent retry",
+           r_status == 200 and again == materialized,
+           "status %d, identical=%s" % (r_status, again == materialized))
+
+    # A complete file (both valid cards in every HDU) is returned
+    # byte-identical.
+    i_status, _, identical = _post_raw(mat, valid)
+    record("complete file byte-identical",
+           i_status == 200 and identical == valid,
+           "status %d, identical=%s" % (i_status, identical == valid))
+
+    # An HDU without blank header card slots fails the whole request
+    # with a stable JSON failure; no file is produced.
+    packed = fixtures.primary_hdu_free_slots(0)
+    s_status, s_headers, s_body = _post_raw(mat, packed)
+    try:
+        s_report = json.loads(s_body.decode("utf-8"))
+    except ValueError:
+        s_report = {}
+    s_failure = s_report.get("failure") or {}
+    s_details = s_failure.get("details") or {}
+    problems = []
+    if s_status != 422:
+        problems.append("status %d != 422" % s_status)
+    if s_headers.get("Content-Type") != "application/json":
+        problems.append("Content-Type %r" % s_headers.get("Content-Type"))
+    if s_failure.get("reason") != "INSUFFICIENT_HEADER_SPACE":
+        problems.append("reason %r" % s_failure.get("reason"))
+    if s_failure.get("hdu") != 0:
+        problems.append("hdu %r" % s_failure.get("hdu"))
+    if s_failure.get("offset") != 35 * 80:
+        problems.append("offset %r" % s_failure.get("offset"))
+    if s_details.get("requiredCards") != 2:
+        problems.append("requiredCards %r" % s_details.get("requiredCards"))
+    if s_details.get("availableCards") != 0:
+        problems.append("availableCards %r" % s_details.get("availableCards"))
+    record("materialize insufficient space", not problems,
+           "; ".join(problems))
+
+    # Invalid existing checksums are refused: JSON rejection, no file.
+    c_status, _, c_body = _post_raw(mat, corrupt_checksum)
+    try:
+        c_report = json.loads(c_body.decode("utf-8"))
+    except ValueError:
+        c_report = {}
+    problems = []
+    if c_status != 422:
+        problems.append("status %d != 422" % c_status)
+    if c_report.get("conclusion") != "REJECTED":
+        problems.append("conclusion %r" % c_report.get("conclusion"))
+    if (c_report.get("failure") or {}).get("reason") != "CHECKSUM_MISMATCH":
+        problems.append("reason %r"
+                        % (c_report.get("failure") or {}).get("reason"))
+    record("materialize rejects corrupt file", not problems,
+           "; ".join(problems))
 
     ok = all(checks)
     print("HTTP smoke: %s (%d/%d checks passed)"
